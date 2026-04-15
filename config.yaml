@@ -1,13 +1,12 @@
+cookie:
+  expiry_days: 30
+  key: random_key
+  name: app_cookie
 credentials:
   usernames:
     admin:
-      email: admin@goingplaces.com
-      name: admin
-      password: "asdzxc" # e.g., $2b$12$....
-cookie:
-  expiry_days: 30
-  key: random_signature_key_going_places_123 # Change this to any random string
-  name: goingplaces_session
-preauthorized:
-  emails:
-  - admin@goingplaces.com
+      name: Admin
+      password: asdzxc
+    user123:
+      name: Arjun xyzzy
+      password: $2b$12$LfBe39L5OAW6ZRDtMdhtnOb/AB0EwwknhfninxpET8b/VEsHznPUO

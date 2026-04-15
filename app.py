@@ -1,6 +1,3 @@
-#strrupdated goingplaces
-
-
 
 import streamlit as st
 import streamlit_authenticator as stauth
@@ -18,6 +15,19 @@ import logging
 from functools import lru_cache
 import time
 import random  # <-- ADD THIS LINE
+
+# =========================
+# PAGE STATE
+# =========================
+if "page" not in st.session_state:
+    st.session_state.page = "home"
+
+if "trip" not in st.session_state:
+    st.session_state.trip = None
+if "center" not in st.session_state:
+    st.session_state.center = None
+if "selected_places" not in st.session_state:
+    st.session_state.selected_places = set()
 
 # ==================================================
 # LOGGING SETUP
@@ -544,7 +554,13 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==================================================
-# LOAD AUTHENTICATION CONFIG
+# AUTH MODE STATE (LOGIN / SIGNUP)
+# ==================================================
+if "auth_mode" not in st.session_state:
+    st.session_state.auth_mode = "login"
+
+# ==================================================
+# LOAD AUTH CONFIG
 # ==================================================
 try:
     with open('config.yaml') as file:
@@ -564,29 +580,108 @@ except Exception as e:
     st.stop()
 
 # ==================================================
-# LOGIN UI - Glass Style
+# TOGGLE BUTTONS
 # ==================================================
-authenticator.login(location='main')
+col1, col2 = st.columns(2)
 
-if st.session_state.get('authentication_status') is False:
-    st.error('❌ Access Denied')
-    st.stop()
-    
-elif st.session_state.get('authentication_status') is None:
+with col1:
+    if st.button(" Login", use_container_width=True):
+        st.session_state.auth_mode = "login"
+
+with col2:
+    if st.button(" Sign Up", use_container_width=True):
+        st.session_state.auth_mode = "signup"
+
+# ==================================================
+# LOGIN MODE
+# ==================================================
+if st.session_state.auth_mode == "login":
+
+    authenticator.login(location='main')
+
+    if st.session_state.get('authentication_status') is False:
+        st.error('❌ Access Denied')
+        st.stop()
+        
+    elif st.session_state.get('authentication_status') is None:
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            st.markdown("""
+                <div style="text-align: center; padding: 60px 40px; background: rgba(255,255,255,0.05); backdrop-filter: blur(20px); border-radius: 24px; border: 1px solid rgba(255,255,255,0.1); margin-top: 100px;">
+                    <h2 style="color: #00f3ff; margin-bottom: 20px;">Authentication Required</h2>
+                    <p style="color: rgba(255,255,255,0.6);">Please sign in to continue</p>
+                </div>
+            """, unsafe_allow_html=True)
+        st.stop()
+
+# ==================================================
+# SIGNUP MODE
+# ==================================================
+elif st.session_state.auth_mode == "signup":
+
     col1, col2, col3 = st.columns([1, 2, 1])
+
     with col2:
         st.markdown("""
-            <div style="text-align: center; padding: 60px 40px; background: rgba(255,255,255,0.05); backdrop-filter: blur(20px); border-radius: 24px; border: 1px solid rgba(255,255,255,0.1); margin-top: 100px;">
-                <h2 style="color: #00f3ff; margin-bottom: 20px;">Authentication Required</h2>
-                <p style="color: rgba(255,255,255,0.6);">Please sign in to access the spatial travel system</p>
+            <div style="padding: 40px; background: rgba(255,255,255,0.05); backdrop-filter: blur(20px); border-radius: 24px; border: 1px solid rgba(255,255,255,0.1); margin-top: 60px;">
+                <h2 style="color: #00f3ff; text-align:center;">Create Account</h2>
             </div>
         """, unsafe_allow_html=True)
+
+        new_name = st.text_input("Full Name")
+        new_username = st.text_input("Username")
+        new_password = st.text_input("Password", type="password")
+        confirm_password = st.text_input("Confirm Password", type="password")
+
+        if st.button("Create Account", use_container_width=True):
+
+            if not new_name or not new_username or not new_password:
+                st.warning("⚠️ Fill all fields")
+
+            elif new_password != confirm_password:
+                st.error("❌ Passwords do not match")
+
+            else:
+                # Reload config
+                with open('config.yaml') as file:
+                    config = yaml.load(file, Loader=SafeLoader)
+
+                if new_username in config['credentials']['usernames']:
+                    st.error("❌ Username already exists")
+
+                else:
+                    # Hash password
+                    hashed_password = stauth.Hasher().hash(new_password)
+
+                    # Add new user
+                    config['credentials']['usernames'][new_username] = {
+                        'name': new_name,
+                        'password': hashed_password
+                    }
+
+                    # Save file
+                    with open('config.yaml', 'w') as file:
+                        yaml.dump(config, file)
+
+                    st.success("✅ Account created successfully!")
+                    st.session_state.auth_mode = "login"
+                    st.rerun()
+
     st.stop()
+
+# ==================================================
+# AFTER LOGIN (MAIN APP)
+# ==================================================
+if st.session_state.get('authentication_status'):
+
+
+    st.sidebar.write(f"👤 {st.session_state['name']}")
 
 # ==================================================
 # MAIN APP
 # ==================================================
 if st.session_state.get('authentication_status'):
+    authenticator.logout("Logout", "sidebar", key="logout_btn_main")
     
     # Initialize session state
     if "trip" not in st.session_state:
@@ -763,7 +858,7 @@ Interest: {interest}"""
             return data
         except Exception as e:
             return {"error": str(e)}
-
+if st.session_state.page == "home":
     # ==================================================
     # HERO BANNER - Glassmorphic
     # ==================================================
@@ -800,7 +895,28 @@ Interest: {interest}"""
     col5, col6 = st.columns([2, 1])
     with col5:
         st.markdown('<p class="input-label">Interests</p>', unsafe_allow_html=True)
-        interest = st.text_input("", placeholder="Nature, History, Food...", label_visibility="collapsed")
+        interest_options = [
+         "Nature 🌿",
+        "History 🏛️",
+        "Food 🍜",
+        "Shopping 🛍️",
+        "Nightlife 🌃",
+        "Adventure 🧗",
+        "Culture 🎭",
+        "Relaxation 🧘",
+        "Photography 📸",
+        "Beaches 🏖️"
+    ]
+
+        selected_interests = st.multiselect(
+        "",
+        interest_options,
+        placeholder="Select your interests",
+        label_visibility="collapsed"
+    )
+
+    # Convert to string (for your existing AI function)
+    interest = ", ".join(selected_interests)
     with col6:
         st.markdown('<p class="input-label">Departure</p>', unsafe_allow_html=True)
         travel_date = st.date_input("", datetime.date.today() + datetime.timedelta(days=7), label_visibility="collapsed")
@@ -809,6 +925,7 @@ Interest: {interest}"""
     col_btn1, col_btn2, col_btn3 = st.columns([1, 2, 1])
     with col_btn2:
         generate_btn = st.button("✨ Generate Itinerary", use_container_width=True)
+    
     st.markdown('</div>', unsafe_allow_html=True)
 
     # ==================================================
