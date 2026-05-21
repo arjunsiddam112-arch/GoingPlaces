@@ -16,6 +16,8 @@ from functools import lru_cache
 import time
 import random  # <-- ADD THIS LINE
 
+LOCK = False
+
 # =========================
 # PAGE STATE
 # =========================
@@ -24,10 +26,16 @@ if "page" not in st.session_state:
 
 if "trip" not in st.session_state:
     st.session_state.trip = None
+if "weather" not in st.session_state:
+    st.session_state.weather = None
 if "center" not in st.session_state:
     st.session_state.center = None
 if "selected_places" not in st.session_state:
     st.session_state.selected_places = set()
+if "travel_date" not in st.session_state:
+    st.session_state.travel_date = datetime.date.today() + datetime.timedelta(days=7)
+if "selected_weather_day" not in st.session_state:
+    st.session_state.selected_weather_day = 0
 
 # ==================================================
 # LOGGING SETUP
@@ -175,6 +183,22 @@ st.markdown("""
                 0 0 0 1px rgba(0, 243, 255, 0.1),
                 inset 0 1px 0 rgba(255, 255, 255, 0.15);
             transform: translateY(-2px);
+        }
+
+        .weather-panel {
+            padding: 28px 32px 28px 22px;
+        }
+
+        .weather-compact {
+            padding: 18px 22px 18px 18px;
+            border-radius: 20px;
+        }
+
+        .weather-metric {
+            background: rgba(255,255,255,0.05);
+            border-radius: 12px;
+            padding: 10px 12px;
+            border: 1px solid rgba(255,255,255,0.06);
         }
         
         /* Typography */
@@ -686,6 +710,8 @@ if st.session_state.get('authentication_status'):
     # Initialize session state
     if "trip" not in st.session_state:
         st.session_state.trip = None
+    if "weather" not in st.session_state:
+        st.session_state.weather = None
     if "center" not in st.session_state:
         st.session_state.center = None
     if "selected_places" not in st.session_state:
@@ -694,6 +720,10 @@ if st.session_state.get('authentication_status'):
         st.session_state.hotels = []
     if "selected_hotel" not in st.session_state:
         st.session_state.selected_hotel = {}
+    if "travel_date" not in st.session_state:
+        st.session_state.travel_date = datetime.date.today() + datetime.timedelta(days=7)
+    if "selected_weather_day" not in st.session_state:
+        st.session_state.selected_weather_day = 0
 
     # Load API keys
     load_dotenv()
@@ -718,6 +748,14 @@ if st.session_state.get('authentication_status'):
         "shopping": "#ffc864"
     }
 
+    CURRENCY_RATES = {
+        "INR": 1,
+        "USD": 0.012,
+        "EUR": 0.011,
+        "GBP": 0.0095,
+        "JPY": 1.8
+    }
+
     CATEGORY_ICONS = {
         "dining": "🍽️",
         "hotel": "🏨",
@@ -729,6 +767,20 @@ if st.session_state.get('authentication_status'):
     # ==================================================
     # HELPER FUNCTIONS
     # ==================================================
+    def safe_generate(prompt):
+        global LOCK
+
+        while LOCK:
+            time.sleep(1)
+
+        LOCK = True
+
+        try:
+            time.sleep(12)
+            return model.generate_content(prompt)
+        finally:
+            LOCK = False
+
     def sanitize_input(text, max_length=500):
         if not text:
             return ""
@@ -829,32 +881,417 @@ if st.session_state.get('authentication_status'):
             logger.error(f"Geocoding error: {str(e)}")
             return None, None
 
-    def get_weather(city):
+    def weather_code_details(code):
+        weather_map = {
+            0: ("☀️", "Clear sky"),
+            1: ("🌤️", "Mainly clear"),
+            2: ("⛅", "Partly cloudy"),
+            3: ("☁️", "Overcast"),
+            45: ("🌫️", "Fog"),
+            48: ("🌫️", "Rime fog"),
+            51: ("🌦️", "Light drizzle"),
+            53: ("🌦️", "Moderate drizzle"),
+            55: ("🌧️", "Dense drizzle"),
+            56: ("🌨️", "Light freezing drizzle"),
+            57: ("🌨️", "Dense freezing drizzle"),
+            61: ("🌦️", "Slight rain"),
+            63: ("🌧️", "Moderate rain"),
+            65: ("🌧️", "Heavy rain"),
+            66: ("🌨️", "Light freezing rain"),
+            67: ("🌨️", "Heavy freezing rain"),
+            71: ("🌨️", "Slight snow"),
+            73: ("❄️", "Moderate snow"),
+            75: ("❄️", "Heavy snow"),
+            77: ("🌨️", "Snow grains"),
+            80: ("🌦️", "Rain showers"),
+            81: ("🌧️", "Rain showers"),
+            82: ("⛈️", "Violent showers"),
+            85: ("🌨️", "Snow showers"),
+            86: ("❄️", "Heavy snow showers"),
+            95: ("⛈️", "Thunderstorm"),
+            96: ("⛈️", "Thunderstorm with hail"),
+            99: ("⛈️", "Severe thunderstorm with hail")
+        }
+        try:
+            normalized_code = int(code)
+        except (TypeError, ValueError):
+            normalized_code = -1
+        return weather_map.get(normalized_code, ("🌤️", "Variable weather"))
+
+    def format_metric(value, suffix="", decimals=0):
+        if value is None:
+            return "N/A"
+        try:
+            return f"{float(value):.{decimals}f}{suffix}"
+        except (TypeError, ValueError):
+            return "N/A"
+
+    def format_date_label(date_str, fmt="%a, %d %b"):
+        try:
+            return datetime.date.fromisoformat(date_str).strftime(fmt)
+        except (TypeError, ValueError):
+            return date_str or "Unknown"
+
+    def format_time_label(timestamp):
+        try:
+            return datetime.datetime.fromisoformat(timestamp).strftime("%I:%M %p").lstrip("0")
+        except (TypeError, ValueError):
+            return "N/A"
+
+    def build_weather_tip(day_data):
+        rain_probability = day_data.get("precipitation_probability", 0) or 0
+        rainfall = day_data.get("precipitation_total", 0) or 0
+        max_temp = day_data.get("temp_max")
+        min_temp = day_data.get("temp_min")
+        wind_speed = day_data.get("wind_speed")
+
+        if rain_probability >= 60 or rainfall >= 5:
+            return "Carry an umbrella and keep indoor options handy for this day."
+        if max_temp is not None and max_temp >= 32:
+            return "Plan outdoor sightseeing early or late and stay hydrated during the afternoon."
+        if min_temp is not None and min_temp <= 10:
+            return "Pack a jacket for cooler morning and evening hours."
+        if wind_speed is not None and wind_speed >= 28:
+            return "Expect breezy conditions, especially around open viewpoints and waterfronts."
+        return "Comfortable sightseeing weather overall with good flexibility for outdoor plans."
+
+    def build_hourly_preview(hourly_data, date_str):
+        preview = []
+        times = hourly_data.get("time", [])
+        temperatures = hourly_data.get("temperature_2m", [])
+        rain_probabilities = hourly_data.get("precipitation_probability", [])
+        weather_codes = hourly_data.get("weather_code", [])
+        preferred_hours = {6, 9, 12, 15, 18, 21}
+
+        for idx, time_str in enumerate(times):
+            if not str(time_str).startswith(date_str):
+                continue
+
+            try:
+                hour_dt = datetime.datetime.fromisoformat(time_str)
+            except ValueError:
+                continue
+
+            if hour_dt.hour not in preferred_hours:
+                continue
+
+            icon, description = weather_code_details(weather_codes[idx] if idx < len(weather_codes) else None)
+            preview.append({
+                "time": hour_dt.strftime("%I %p").lstrip("0"),
+                "temperature": temperatures[idx] if idx < len(temperatures) else None,
+                "precipitation_probability": rain_probabilities[idx] if idx < len(rain_probabilities) else None,
+                "description": description,
+                "icon": icon
+            })
+
+        if preview:
+            return preview[:6]
+
+        fallback_preview = []
+        fallback_counter = 0
+        for idx, time_str in enumerate(times):
+            if not str(time_str).startswith(date_str):
+                continue
+            fallback_counter += 1
+            if fallback_counter % 4 != 1:
+                continue
+            try:
+                hour_dt = datetime.datetime.fromisoformat(time_str)
+            except ValueError:
+                continue
+            icon, description = weather_code_details(weather_codes[idx] if idx < len(weather_codes) else None)
+            fallback_preview.append({
+                "time": hour_dt.strftime("%I %p").lstrip("0"),
+                "temperature": temperatures[idx] if idx < len(temperatures) else None,
+                "precipitation_probability": rain_probabilities[idx] if idx < len(rain_probabilities) else None,
+                "description": description,
+                "icon": icon
+            })
+            if len(fallback_preview) >= 6:
+                break
+
+        return fallback_preview[:6]
+
+    def get_weather(city, trip_date=None):
         city = sanitize_input(city, 100)
-        if not city or not WEATHER_API_KEY:
+        if not city:
             return None
 
         try:
-            url = f"https://api.openweathermap.org/data/2.5/weather?q={city}&appid={WEATHER_API_KEY}&units=metric"
-            response = requests.get(url, timeout=10)
+            lat, lon = get_location(city)
+            if not is_valid_coordinates(lat, lon):
+                known_center = known_destination_center(city)
+                if known_center:
+                    lat, lon = known_center
+                else:
+                    return None
+
+            params = {
+                "latitude": float(lat),
+                "longitude": float(lon),
+                "current": ",".join([
+                    "temperature_2m",
+                    "apparent_temperature",
+                    "relative_humidity_2m",
+                    "wind_speed_10m",
+                    "weather_code"
+                ]),
+                "daily": ",".join([
+                    "weather_code",
+                    "temperature_2m_max",
+                    "temperature_2m_min",
+                    "apparent_temperature_max",
+                    "apparent_temperature_min",
+                    "precipitation_probability_max",
+                    "precipitation_sum",
+                    "wind_speed_10m_max",
+                    "sunrise",
+                    "sunset"
+                ]),
+                "hourly": ",".join([
+                    "temperature_2m",
+                    "precipitation_probability",
+                    "weather_code"
+                ]),
+                "forecast_days": 7,
+                "timezone": "auto",
+                "temperature_unit": "celsius",
+                "wind_speed_unit": "kmh",
+                "precipitation_unit": "mm"
+            }
+
+            response = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=10)
             response.raise_for_status()
             data = response.json()
 
-            main = data.get("main", {})
-            weather = (data.get("weather") or [{}])[0]
-            wind = data.get("wind", {})
+            current = data.get("current", {})
+            daily = data.get("daily", {})
+            hourly = data.get("hourly", {})
+            dates = daily.get("time", [])[:7]
+            forecast_days = []
+
+            for idx, date_str in enumerate(dates):
+                code = (daily.get("weather_code") or [None] * len(dates))[idx]
+                icon, description = weather_code_details(code)
+                day_data = {
+                    "date": date_str,
+                    "label": format_date_label(date_str, "%a, %d %b"),
+                    "short_label": format_date_label(date_str, "%d %b"),
+                    "day_name": format_date_label(date_str, "%a"),
+                    "description": description,
+                    "icon": icon,
+                    "temp_max": (daily.get("temperature_2m_max") or [None] * len(dates))[idx],
+                    "temp_min": (daily.get("temperature_2m_min") or [None] * len(dates))[idx],
+                    "feels_like_max": (daily.get("apparent_temperature_max") or [None] * len(dates))[idx],
+                    "feels_like_min": (daily.get("apparent_temperature_min") or [None] * len(dates))[idx],
+                    "precipitation_probability": (daily.get("precipitation_probability_max") or [None] * len(dates))[idx],
+                    "precipitation_total": (daily.get("precipitation_sum") or [None] * len(dates))[idx],
+                    "wind_speed": (daily.get("wind_speed_10m_max") or [None] * len(dates))[idx],
+                    "sunrise": format_time_label((daily.get("sunrise") or [None] * len(dates))[idx]),
+                    "sunset": format_time_label((daily.get("sunset") or [None] * len(dates))[idx]),
+                    "hourly_preview": build_hourly_preview(hourly, date_str)
+                }
+                day_data["tip"] = build_weather_tip(day_data)
+                forecast_days.append(day_data)
+
+            if not forecast_days:
+                return None
+
+            current_icon, current_description = weather_code_details(current.get("weather_code"))
+            selected_index = 0
+            travel_date_in_range = False
+            serialized_trip_date = None
+
+            if isinstance(trip_date, datetime.date):
+                serialized_trip_date = trip_date.isoformat()
+                for idx, day_data in enumerate(forecast_days):
+                    if day_data["date"] == serialized_trip_date:
+                        selected_index = idx
+                        travel_date_in_range = True
+                        break
 
             return {
-                "city": sanitize_input(data.get("name", city), 100),
-                "temperature": main.get("temp"),
-                "feels_like": main.get("feels_like"),
-                "humidity": main.get("humidity"),
-                "description": sanitize_input(weather.get("description", "Unknown").title(), 120),
-                "wind_speed": wind.get("speed")
+                "city": city.title(),
+                "latitude": float(lat),
+                "longitude": float(lon),
+                "current": {
+                    "temperature": current.get("temperature_2m"),
+                    "feels_like": current.get("apparent_temperature"),
+                    "humidity": current.get("relative_humidity_2m"),
+                    "wind_speed": current.get("wind_speed_10m"),
+                    "description": current_description,
+                    "icon": current_icon,
+                    "time": current.get("time")
+                },
+                "daily": forecast_days,
+                "selected_index": selected_index,
+                "travel_date": serialized_trip_date,
+                "travel_date_in_range": travel_date_in_range,
+                "forecast_window": f"{forecast_days[0]['label']} - {forecast_days[-1]['label']}",
+                "fetched_at": datetime.datetime.now().strftime("%d %b %Y, %I:%M %p")
             }
         except Exception as e:
-            logger.error(f"Weather API error: {str(e)}")
+            logger.error(f"Weather forecast error: {str(e)}")
             return None
+
+    def render_weather_card(weather_data):
+        if not weather_data:
+            st.error("Unable to fetch the 7-day weather forecast for this destination right now.")
+            return
+
+        current_weather = weather_data.get("current", {})
+        forecast_days = weather_data.get("daily", [])
+        if not forecast_days:
+            st.error("Weather data is unavailable for the selected destination.")
+            return
+
+        selected_index = st.session_state.get("selected_weather_day", weather_data.get("selected_index", 0))
+        if selected_index >= len(forecast_days):
+            selected_index = 0
+            st.session_state.selected_weather_day = 0
+        selected_day = forecast_days[selected_index]
+
+        header_col, action_col = st.columns([6, 1])
+        with header_col:
+            st.markdown(
+                f"""
+                <div class="glass-panel weather-compact">
+                    <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;">
+                        <div>
+                            <p style="margin: 0; color: rgba(255,255,255,0.58); text-transform: uppercase; letter-spacing: 0.08em; font-size: 0.72rem; font-weight: 700;">Weather Snapshot</p>
+                            <h3 style="margin: 4px 0 0 0; font-size: 1.15rem;">{current_weather.get('icon', '🌤️')} {weather_data['city']}</h3>
+                            <p style="margin: 4px 0 0 0; color: rgba(255,255,255,0.68); font-size: 0.88rem;">{weather_data.get('forecast_window', 'Next 7 days')}</p>
+                        </div>
+                        <div style="text-align: right;">
+                            <div style="color: #00f3ff; font-size: 1.7rem; font-weight: 700; text-shadow: 0 0 14px rgba(0, 243, 255, 0.35); line-height: 1;">
+                                {format_metric(current_weather.get("temperature"), "°C")}
+                            </div>
+                            <p style="margin: 4px 0 0 0; color: rgba(255,255,255,0.74); font-size: 0.84rem;">{current_weather.get("description", "Current conditions")}</p>
+                        </div>
+                    </div>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; margin-top: 14px;">
+                        <div class="weather-metric">
+                            <p style="margin: 0; color: rgba(255,255,255,0.52); font-size: 0.72rem;">Feels Like</p>
+                            <p style="margin: 4px 0 0 0; color: #fff; font-weight: 600; font-size: 0.92rem;">{format_metric(current_weather.get("feels_like"), "°C")}</p>
+                        </div>
+                        <div class="weather-metric">
+                            <p style="margin: 0; color: rgba(255,255,255,0.52); font-size: 0.72rem;">Humidity</p>
+                            <p style="margin: 4px 0 0 0; color: #fff; font-weight: 600; font-size: 0.92rem;">{format_metric(current_weather.get("humidity"), "%")}</p>
+                        </div>
+                        <div class="weather-metric">
+                            <p style="margin: 0; color: rgba(255,255,255,0.52); font-size: 0.72rem;">Wind</p>
+                            <p style="margin: 4px 0 0 0; color: #fff; font-weight: 600; font-size: 0.92rem;">{format_metric(current_weather.get("wind_speed"), " km/h")}</p>
+                        </div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+        with action_col:
+            st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+            if st.button("🔄 Refresh", key="refresh_weather", use_container_width=True):
+                refreshed_weather = get_weather(
+                    st.session_state.get("destination", weather_data["city"]),
+                    st.session_state.get("travel_date")
+                )
+                if refreshed_weather:
+                    st.session_state.weather = refreshed_weather
+                    st.session_state.selected_weather_day = refreshed_weather.get("selected_index", 0)
+                    st.rerun()
+                st.warning("Unable to refresh forecast right now. Please try again in a moment.")
+
+        trip_date = weather_data.get("travel_date")
+        if trip_date and weather_data.get("travel_date_in_range"):
+            st.caption(f"Trip date {format_date_label(trip_date, '%d %b %Y')} is included in this forecast.")
+        elif trip_date:
+            st.caption(
+                f"Trip date {format_date_label(trip_date, '%d %b %Y')} is outside the current 7-day window."
+            )
+
+        with st.expander("View detailed forecast", expanded=False):
+            day_options = list(range(len(forecast_days)))
+            st.radio(
+                "Choose a forecast day",
+                options=day_options,
+                index=selected_index,
+                horizontal=True,
+                key="selected_weather_day",
+                format_func=lambda idx: (
+                    f"{forecast_days[idx]['day_name']} {forecast_days[idx]['short_label']} "
+                    f"{forecast_days[idx]['icon']} {format_metric(forecast_days[idx]['temp_max'], '°')}/"
+                    f"{format_metric(forecast_days[idx]['temp_min'], '°')}"
+                )
+            )
+            selected_day = forecast_days[st.session_state.get("selected_weather_day", 0)]
+
+            st.markdown(
+                f"""
+                <div class="glass-panel weather-panel">
+                    <div style="display: flex; justify-content: space-between; gap: 14px; align-items: center; flex-wrap: wrap;">
+                        <div>
+                            <p style="margin: 0; color: rgba(255,255,255,0.58); text-transform: uppercase; letter-spacing: 0.08em; font-size: 0.72rem; font-weight: 700;">Selected Forecast</p>
+                            <h3 style="margin: 6px 0 0 0;">{selected_day['icon']} {selected_day['label']}</h3>
+                            <p style="margin: 6px 0 0 0; color: rgba(255,255,255,0.72); font-size: 0.9rem;">{selected_day['description']}</p>
+                        </div>
+                        <div style="text-align: right;">
+                            <div style="color: #fff; font-size: 1.15rem; font-weight: 700;">
+                                {format_metric(selected_day.get("temp_max"), "°C")} / {format_metric(selected_day.get("temp_min"), "°C")}
+                            </div>
+                            <p style="margin: 6px 0 0 0; color: rgba(255,255,255,0.68); font-size: 0.84rem;">High / Low</p>
+                        </div>
+                    </div>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-top: 16px;">
+                        <div class="weather-metric">
+                            <p style="margin: 0; color: rgba(255,255,255,0.55); font-size: 0.75rem;">Feels Like</p>
+                            <p style="margin: 4px 0 0 0; color: #fff; font-weight: 600; font-size: 0.9rem;">{format_metric(selected_day.get("feels_like_min"), "°C")} to {format_metric(selected_day.get("feels_like_max"), "°C")}</p>
+                        </div>
+                        <div class="weather-metric">
+                            <p style="margin: 0; color: rgba(255,255,255,0.55); font-size: 0.75rem;">Rain Chance</p>
+                            <p style="margin: 4px 0 0 0; color: #fff; font-weight: 600; font-size: 0.9rem;">{format_metric(selected_day.get("precipitation_probability"), "%")}</p>
+                        </div>
+                        <div class="weather-metric">
+                            <p style="margin: 0; color: rgba(255,255,255,0.55); font-size: 0.75rem;">Rainfall</p>
+                            <p style="margin: 4px 0 0 0; color: #fff; font-weight: 600; font-size: 0.9rem;">{format_metric(selected_day.get("precipitation_total"), " mm", 1)}</p>
+                        </div>
+                        <div class="weather-metric">
+                            <p style="margin: 0; color: rgba(255,255,255,0.55); font-size: 0.75rem;">Max Wind</p>
+                            <p style="margin: 4px 0 0 0; color: #fff; font-weight: 600; font-size: 0.9rem;">{format_metric(selected_day.get("wind_speed"), " km/h")}</p>
+                        </div>
+                        <div class="weather-metric">
+                            <p style="margin: 0; color: rgba(255,255,255,0.55); font-size: 0.75rem;">Sunrise</p>
+                            <p style="margin: 4px 0 0 0; color: #fff; font-weight: 600; font-size: 0.9rem;">{selected_day.get("sunrise", "N/A")}</p>
+                        </div>
+                        <div class="weather-metric">
+                            <p style="margin: 0; color: rgba(255,255,255,0.55); font-size: 0.75rem;">Sunset</p>
+                            <p style="margin: 4px 0 0 0; color: #fff; font-weight: 600; font-size: 0.9rem;">{selected_day.get("sunset", "N/A")}</p>
+                        </div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+            st.markdown("**Day Planner Tip**")
+            st.caption(selected_day.get("tip", "Weather guidance is unavailable for this day."))
+
+            hourly_preview = selected_day.get("hourly_preview", [])
+            if hourly_preview:
+                st.markdown("**Hourly Snapshot**")
+                hour_cols = st.columns(len(hourly_preview))
+                for col, hour in zip(hour_cols, hourly_preview):
+                    with col:
+                        st.markdown(
+                            f"""
+                            <div style="background: rgba(255,255,255,0.06); border-radius: 14px; padding: 10px; text-align: center; border: 1px solid rgba(255,255,255,0.08); min-height: 132px;">
+                                <p style="margin: 0; color: rgba(255,255,255,0.65); font-size: 0.78rem;">{hour['time']}</p>
+                                <div style="font-size: 1.45rem; margin: 6px 0;">{hour['icon']}</div>
+                                <p style="margin: 0; color: #fff; font-weight: 700; font-size: 0.95rem;">{format_metric(hour.get('temperature'), '°C')}</p>
+                                <p style="margin: 4px 0 0 0; color: rgba(255,255,255,0.72); font-size: 0.76rem;">{hour['description']}</p>
+                                <p style="margin: 4px 0 0 0; color: rgba(255,255,255,0.65); font-size: 0.74rem;">Rain {format_metric(hour.get('precipitation_probability'), '%')}</p>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
 
     def extract_json_robust(text):
         import re
@@ -912,6 +1349,8 @@ Rules:
 - Include dining, attractions, shopping, events
 - Each place must include a precise address or neighborhood in an address field
 - Each place must include real-world decimal lat and lon fields for the exact place
+- Each place must include "price": numeric INR estimate per person
+- Each place must include "rating": numeric value from 0 to 5
 - Include 5 hotel recommendations in the hotels array
 - Hotel prices must be numeric INR values per night
 - Hotel ratings must be numeric values out of 5
@@ -920,13 +1359,13 @@ Rules:
 - No markdown
 
 Format:
-{{"days":[{{"day":1,"places":[{{"name":"Place Name","category":"attraction","description":"Short description","address":"Neighborhood or full address, City, Country","lat":35.6895,"lon":139.6917}}]}}],"hotels":[{{"name":"Hotel Name","price":3000,"rating":4.2}}]}}
+{{"days":[{{"day":1,"places":[{{"name":"Place Name","category":"attraction","description":"Short description","address":"Location","lat":35.0,"lon":139.0,"price":500,"rating":4.3}}]}}],"hotels":[{{"name":"Hotel Name","price":3000,"rating":4.2}}]}}
 
 Trip details:
 People: {people}
 Budget: {budget}
 Interest: {interest}"""
-            response = model.generate_content(prompt)
+            response = safe_generate(prompt)
             return response.text
         except Exception as e:
             logger.error(f"Gemini API error: {str(e)}")
@@ -1004,6 +1443,18 @@ Interest: {interest}"""
             reverse=(order == "desc")
         )
 
+    def convert_currency(amount, rate):
+        try:
+            return float(amount) * rate
+        except (TypeError, ValueError):
+            return 0
+
+    def convert_to_inr(amount, rate):
+        try:
+            return float(amount) / rate
+        except (TypeError, ValueError, ZeroDivisionError):
+            return 0
+
     def render_category_legend():
         legend_items = "".join(
             f"""
@@ -1074,8 +1525,17 @@ if st.session_state.page == "home":
         st.markdown('<p class="input-label">Travelers</p>', unsafe_allow_html=True)
         people = st.number_input("", 1, 20, 1, label_visibility="collapsed")
     with col4:
-        st.markdown('<p class="input-label">Budget (INR)</p>', unsafe_allow_html=True)
-        budget = st.number_input("", 5000, 10000000, 50000, step=5000, label_visibility="collapsed")
+        st.markdown('<p class="input-label">Budget</p>', unsafe_allow_html=True)
+        budget_col, currency_col = st.columns([2, 1])
+        with budget_col:
+            budget = st.number_input("", 5000, 10000000, 50000, step=5000, label_visibility="collapsed")
+        with currency_col:
+            budget_currency = st.selectbox(
+                "Currency",
+                ["INR", "USD", "EUR", "GBP", "JPY"],
+                key="budget_currency",
+                label_visibility="collapsed"
+            )
 
     col5, col6 = st.columns([2, 1])
     with col5:
@@ -1104,101 +1564,17 @@ if st.session_state.page == "home":
     interest = ", ".join(selected_interests)
     with col6:
         st.markdown('<p class="input-label">Departure</p>', unsafe_allow_html=True)
-        travel_date = st.date_input("", datetime.date.today() + datetime.timedelta(days=7), label_visibility="collapsed")
+        travel_date = st.date_input(
+            "",
+            st.session_state.get("travel_date", datetime.date.today() + datetime.timedelta(days=7)),
+            label_visibility="collapsed"
+        )
 
     st.markdown('<br>', unsafe_allow_html=True)
     col_btn1, col_btn2, col_btn3 = st.columns([1, 2, 1])
     with col_btn2:
         generate_btn = st.button("✨ Generate Itinerary", use_container_width=True)
     
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    # ==================================================
-    # WEATHER INSIGHTS
-    # ==================================================
-    weather_default_city = sanitize_input(dest, 100) if "dest" in locals() and dest else sanitize_input(st.session_state.get("destination", ""), 100)
-    if weather_default_city and not st.session_state.get("weather_city"):
-        st.session_state.weather_city = weather_default_city
-
-    st.markdown('<br>', unsafe_allow_html=True)
-    st.markdown('<div class="glass-panel">', unsafe_allow_html=True)
-    st.markdown('<h2 style="margin-top: 0;">🌦️ Weather Insights</h2>', unsafe_allow_html=True)
-
-    weather_col1, weather_col2 = st.columns([3, 1])
-    with weather_col1:
-        st.markdown('<p class="input-label">City</p>', unsafe_allow_html=True)
-        weather_city = st.text_input(
-            "",
-            placeholder="Enter a city name",
-            key="weather_city",
-            label_visibility="collapsed"
-        )
-    with weather_col2:
-        st.markdown('<p class="input-label">&nbsp;</p>', unsafe_allow_html=True)
-        get_weather_btn = st.button("Get Weather", use_container_width=True, key="get_weather_btn")
-
-    if get_weather_btn:
-        if not weather_city:
-            st.error("Please enter a city name to get weather insights.")
-        else:
-            weather_data = get_weather(weather_city)
-            if weather_data:
-                condition = weather_data["description"].lower()
-                weather_emoji = "☀️"
-                if "rain" in condition:
-                    weather_emoji = "🌧️"
-                elif "cloud" in condition:
-                    weather_emoji = "☁️"
-                elif "clear" in condition:
-                    weather_emoji = "☀️"
-                elif "snow" in condition:
-                    weather_emoji = "❄️"
-                elif "storm" in condition or "thunder" in condition:
-                    weather_emoji = "⛈️"
-                elif "mist" in condition or "fog" in condition or "haze" in condition:
-                    weather_emoji = "🌫️"
-
-                st.markdown(f"""
-                    <div style="
-                        margin-top: 18px;
-                        padding: 24px;
-                        border-radius: 20px;
-                        background: linear-gradient(135deg, rgba(0, 243, 255, 0.14), rgba(255, 255, 255, 0.06));
-                        border: 1px solid rgba(0, 243, 255, 0.25);
-                        box-shadow: 0 8px 28px rgba(0, 0, 0, 0.24), inset 0 1px 0 rgba(255, 255, 255, 0.12);
-                    ">
-                        <div style="display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;">
-                            <div>
-                                <p style="margin: 0; color: rgba(255,255,255,0.58); text-transform: uppercase; letter-spacing: 0.08em; font-size: 0.78rem; font-weight: 700;">Current Weather</p>
-                                <h3 style="margin: 6px 0 0 0; color: #fff; font-size: 1.55rem;">{weather_emoji} {weather_data["city"]}</h3>
-                            </div>
-                            <div style="color: #00f3ff; font-size: 2.4rem; font-weight: 700; text-shadow: 0 0 20px rgba(0, 243, 255, 0.45);">
-                                {weather_data["temperature"]}°C
-                            </div>
-                        </div>
-                        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin-top: 22px;">
-                            <div style="background: rgba(255,255,255,0.06); border-radius: 14px; padding: 14px; border-left: 3px solid #00f3ff;">
-                                <p style="margin: 0; color: rgba(255,255,255,0.55); font-size: 0.8rem;">Feels Like</p>
-                                <p style="margin: 6px 0 0 0; color: #fff; font-weight: 600;">{weather_data["feels_like"]}°C</p>
-                            </div>
-                            <div style="background: rgba(255,255,255,0.06); border-radius: 14px; padding: 14px; border-left: 3px solid #00f3ff;">
-                                <p style="margin: 0; color: rgba(255,255,255,0.55); font-size: 0.8rem;">Condition</p>
-                                <p style="margin: 6px 0 0 0; color: #fff; font-weight: 600;">{weather_data["description"]}</p>
-                            </div>
-                            <div style="background: rgba(255,255,255,0.06); border-radius: 14px; padding: 14px; border-left: 3px solid #00f3ff;">
-                                <p style="margin: 0; color: rgba(255,255,255,0.55); font-size: 0.8rem;">Humidity</p>
-                                <p style="margin: 6px 0 0 0; color: #fff; font-weight: 600;">{weather_data["humidity"]}%</p>
-                            </div>
-                            <div style="background: rgba(255,255,255,0.06); border-radius: 14px; padding: 14px; border-left: 3px solid #00f3ff;">
-                                <p style="margin: 0; color: rgba(255,255,255,0.55); font-size: 0.8rem;">Wind Speed</p>
-                                <p style="margin: 6px 0 0 0; color: #fff; font-weight: 600;">{weather_data["wind_speed"]} m/s</p>
-                            </div>
-                        </div>
-                    </div>
-                """, unsafe_allow_html=True)
-            else:
-                st.error("Unable to fetch weather data. Please check the city name.")
-
     st.markdown('</div>', unsafe_allow_html=True)
 
     # ==================================================
@@ -1228,7 +1604,8 @@ if st.session_state.page == "home":
                     else:
                         lat = lon = None
                 
-                raw = generate_plan(dest, days, people, budget, interest)
+                budget_in_inr = convert_to_inr(budget, CURRENCY_RATES[budget_currency])
+                raw = generate_plan(dest, days, people, budget_in_inr, interest)
                 if not raw:
                     loading_placeholder.empty()
                     st.error("❌ AI generation failed")
@@ -1262,6 +1639,14 @@ if st.session_state.page == "home":
                             unresolved_places.append(p)
                         p["selected"] = True
                         p["id"] = f"{d['day']}_{p['name']}_{random.randint(1000,9999)}"
+                        try:
+                            p["price"] = float(p.get("price", random.randint(200, 1500)))
+                        except (TypeError, ValueError):
+                            p["price"] = float(random.randint(200, 1500))
+                        try:
+                            p["rating"] = float(p.get("rating", round(random.uniform(3.5, 4.8), 1)))
+                        except (TypeError, ValueError):
+                            p["rating"] = float(round(random.uniform(3.5, 4.8), 1))
 
                 if not is_valid_coordinates(lat, lon) and place_center is not None:
                     lat, lon = place_center
@@ -1278,6 +1663,12 @@ if st.session_state.page == "home":
                 st.session_state.hotels = data.get("hotels", [])
                 st.session_state.selected_hotel = {}
                 st.session_state.destination = dest
+                st.session_state.travel_date = travel_date
+                st.session_state.weather = get_weather(dest, travel_date)
+                st.session_state.selected_weather_day = (
+                    st.session_state.weather.get("selected_index", 0)
+                    if st.session_state.weather else 0
+                )
                 st.session_state.center = (lat, lon)
                 st.session_state.selected_places = set()
                 
@@ -1294,6 +1685,10 @@ if st.session_state.page == "home":
     if st.session_state.trip:
         trip = st.session_state.trip
         st.markdown("---")
+
+        selected_currency = budget_currency
+        rate = CURRENCY_RATES[selected_currency]
+        converted_budget = budget
         
         # Header with stats
         col_stats1, col_stats2, col_stats3, col_stats4 = st.columns(4)
@@ -1315,8 +1710,8 @@ if st.session_state.page == "home":
         with col_stats3:
             st.markdown(f"""
                 <div class="metric-glass">
-                    <div class="metric-value">₹{budget//1000}k</div>
-                    <div class="metric-label">Budget</div>
+                    <div class="metric-value">{converted_budget/1000:.0f}k</div>
+                    <div class="metric-label">Budget ({selected_currency})</div>
                 </div>
             """, unsafe_allow_html=True)
         with col_stats4:
@@ -1327,6 +1722,8 @@ if st.session_state.page == "home":
                 </div>
             """, unsafe_allow_html=True)
 
+        st.markdown("<br>", unsafe_allow_html=True)
+        render_weather_card(st.session_state.get("weather"))
         st.markdown("<br>", unsafe_allow_html=True)
         
         # Main content
@@ -1359,6 +1756,8 @@ if st.session_state.page == "home":
                             
                             # Card HTML
                             card_class = "place-card selected" if is_selected else "place-card"
+                            converted_price = convert_currency(p.get("price", 0), rate)
+                            place_rating = p.get("rating", 0)
                             
                             st.markdown(f"""
                                 <div class="{card_class}" onclick="togglePlace('{place_id}')" id="card-{place_id}">
@@ -1367,6 +1766,8 @@ if st.session_state.page == "home":
                                             <span class="place-category-badge {cat_class}">{CATEGORY_ICONS.get(cat, '📍')} {cat.title()}</span>
                                             <h4 style="margin: 8px 0 4px 0; color: #fff; font-size: 1.1rem; font-weight: 600;">{p['name']}</h4>
                                             <p style="margin: 0; color: rgba(255,255,255,0.7); font-size: 0.9rem; line-height: 1.4;">{p['description'][:80]}...</p>
+                                            <p style="margin: 8px 0 0 0; color: rgba(255,255,255,0.82); font-size: 0.85rem;">💰 {converted_price:.0f} {selected_currency}</p>
+                                            <p style="margin: 4px 0 0 0; color: rgba(255,255,255,0.72); font-size: 0.85rem;">⭐ {place_rating} / 5</p>
                                             <p class="place-time">🕐 {p.get('timeOfDay', 'All day')}</p>
                                         </div>
                                     </div>
@@ -1425,10 +1826,11 @@ if st.session_state.page == "home":
                     st.session_state.selected_hotel = selected_hotel or {}
 
                     for h in sorted_hotels:
+                        h["price_converted"] = convert_currency(h.get("price", 0), rate)
                         st.markdown(f"""
                             <div style="background: rgba(255,255,255,0.05); border-radius: 12px; padding: 16px; margin: 8px 0; border-left: 3px solid #00f3ff;">
                                 <h4 style="margin: 0 0 8px 0; color: #fff;">{h['name']}</h4>
-                                <p style="margin: 0 0 4px 0; color: rgba(255,255,255,0.8);">💰 ₹{int(h['price']):,}</p>
+                                <p style="margin: 0 0 4px 0; color: rgba(255,255,255,0.8);">💰 {h["price_converted"]:.0f} {selected_currency}</p>
                                 <p style="margin: 0; color: rgba(255,255,255,0.6);">⭐ {h['rating']} / 5.0</p>
                             </div>
                         """, unsafe_allow_html=True)
@@ -1540,10 +1942,14 @@ if st.session_state.page == "home":
                     for idx, p in enumerate(day_items):
                         with cols[idx % 3]:
                             cat = p.get("category", "attraction")
+                            converted_price = convert_currency(p.get("price", 0), rate)
+                            place_rating = p.get("rating", 0)
                             st.markdown(f"""
                                 <div style="background: rgba(255,255,255,0.05); border-radius: 12px; padding: 12px; margin: 8px 0; border-left: 3px solid {COLORS.get(cat, '#00f3ff')};">
                                     <p style="margin: 0; color: #fff; font-weight: 500; font-size: 0.9rem;">{CATEGORY_ICONS.get(cat, '📍')} {p['name']}</p>
                                     <p style="margin: 4px 0 0 0; color: rgba(255,255,255,0.5); font-size: 0.75rem; text-transform: uppercase;">{cat}</p>
+                                    <p style="margin: 8px 0 0 0; color: rgba(255,255,255,0.8); font-size: 0.82rem;">💰 {converted_price:.0f} {selected_currency}</p>
+                                    <p style="margin: 4px 0 0 0; color: rgba(255,255,255,0.65); font-size: 0.82rem;">⭐ {place_rating} / 5</p>
                                 </div>
                             """, unsafe_allow_html=True)
         
